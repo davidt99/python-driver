@@ -29,10 +29,10 @@ from cassandra.cluster import NoHostAvailable, ConnectionShutdown, Cluster
 from cassandra.io.asyncorereactor import AsyncoreConnection
 from cassandra.protocol import QueryMessage
 from cassandra.connection import Connection
-from cassandra.policies import WhiteListRoundRobinPolicy, HostStateListener
+from cassandra.policies import HostFilterPolicy, RoundRobinPolicy, HostStateListener
 from cassandra.pool import HostConnectionPool
 
-from tests import is_monkey_patched
+from tests import is_monkey_patched, notwindows
 from tests.integration import use_singledc, PROTOCOL_VERSION, get_node, CASSANDRA_IP, local
 
 try:
@@ -50,8 +50,12 @@ class ConnectionTimeoutTest(unittest.TestCase):
     def setUp(self):
         self.defaultInFlight = Connection.max_in_flight
         Connection.max_in_flight = 2
-        self.cluster = Cluster(protocol_version=PROTOCOL_VERSION, load_balancing_policy=
-                            WhiteListRoundRobinPolicy([CASSANDRA_IP]))
+        self.cluster = Cluster(
+            protocol_version=PROTOCOL_VERSION,
+            load_balancing_policy=HostFilterPolicy(
+                RoundRobinPolicy(), predicate=lambda host: host.address == CASSANDRA_IP
+            )
+        )
         self.session = self.cluster.connect()
 
     def tearDown(self):
@@ -360,6 +364,9 @@ class ConnectionTests(object):
         for t in threads:
             t.join()
 
+    # We skip this one for windows because the clock is not as
+    # granular as in linux
+    @notwindows
     def test_connect_timeout(self):
         # Underlying socket implementations don't always throw a socket timeout even with min float
         # This can be timing sensitive, added retry to ensure failure occurs if it can
