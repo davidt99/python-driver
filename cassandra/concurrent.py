@@ -29,7 +29,8 @@ log = logging.getLogger(__name__)
 
 ExecutionResult = namedtuple('ExecutionResult', ['success', 'result_or_exc'])
 
-def execute_concurrent(session, statements_and_parameters, concurrency=100, raise_on_first_error=True, results_generator=False):
+def execute_concurrent(session, statements_and_parameters, concurrency=100, raise_on_first_error=True,
+                       results_generator=False, consume_on_caller=False):
     """
     Executes a sequence of (statement, parameters) tuples concurrently.  Each
     ``parameters`` item must be a sequence or :const:`None`.
@@ -88,8 +89,12 @@ def execute_concurrent(session, statements_and_parameters, concurrency=100, rais
     if not statements_and_parameters:
         return []
 
-    executor = ConcurrentExecutorGenResults(session, statements_and_parameters) if results_generator else ConcurrentExecutorListResults(session, statements_and_parameters)
-    return executor.execute(concurrency, raise_on_first_error)
+    if results_generator:
+        executor = ConcurrentExecutorGenResults(session, statements_and_parameters)
+    else:
+        executor = ConcurrentExecutorListResults(session, statements_and_parameters)
+
+    return executor.execute(concurrency, raise_on_first_error, consume_on_caller)
 
 
 class _ConcurrentExecutor(object):
@@ -101,21 +106,38 @@ class _ConcurrentExecutor(object):
         self._enum_statements = enumerate(iter(statements_and_params))
         self._condition = Condition()
         self._fail_fast = False
+        self._consume_on_caller = False
         self._results_queue = []
         self._current = 0
         self._exec_count = 0
         self._exec_depth = 0
 
-    def execute(self, concurrency, fail_fast):
+    def execute(self, concurrency, fail_fast, consume_on_caller):
         self._fail_fast = fail_fast
+        self._consume_on_caller = consume_on_caller
         self._results_queue = []
         self._current = 0
         self._exec_count = 0
+
+        execution_parameters = []
+        for n in xrange(concurrency):
+            has_more_items, execution_parameter = self._get_next_execution_params()
+            if not has_more_items:
+                break
+            execution_parameters.append(execution_parameter)
+
         with self._condition:
-            for n in xrange(concurrency):
-                if not self._execute_next():
-                    break
+            for idx, (statement, params) in execution_parameters:
+                self._exec_count += 1
+                self._execute(idx, statement, params)
         return self._results()
+
+    def _get_next_execution_params(self):
+        try:
+            (idx, (statement, params)) = next(self._enum_statements)
+            return True, (idx, (statement, params))
+        except StopIteration:
+            return False, None
 
     def _execute_next(self):
         # lock must be held
@@ -164,26 +186,37 @@ class _ConcurrentExecutor(object):
         else:
             raise exc
 
+    def _results(self):
+        raise NotImplementedError()
+
+    def _put_result(self, result, idx, success):
+        raise NotImplementedError()
+
 
 class ConcurrentExecutorGenResults(_ConcurrentExecutor):
 
     def _put_result(self, result, idx, success):
         with self._condition:
             heappush(self._results_queue, (idx, ExecutionResult(success, result)))
-            self._execute_next()
+            if not self._consume_on_caller:
+                self._execute_next()
             self._condition.notify()
 
     def _results(self):
         with self._condition:
             while self._current < self._exec_count:
+                #  Wait until the next chronological result return, so we yield the results in the right order
                 while not self._results_queue or self._results_queue[0][0] != self._current:
                     self._condition.wait()
+                # Consume all results until we reach the first out-of-sync result or we run out of results
                 while self._results_queue and self._results_queue[0][0] == self._current:
                     _, res = heappop(self._results_queue)
                     try:
                         self._condition.release()
                         if self._fail_fast and not res[0]:
                             self._raise(res[1])
+                        if self._consume_on_caller:
+                            self._execute_next()
                         yield res
                     finally:
                         self._condition.acquire()
@@ -193,10 +226,12 @@ class ConcurrentExecutorGenResults(_ConcurrentExecutor):
 class ConcurrentExecutorListResults(_ConcurrentExecutor):
 
     _exception = None
+    _concurrency = None
 
-    def execute(self, concurrency, fail_fast):
+    def execute(self, concurrency, fail_fast, consume_on_caller):
         self._exception = None
-        return super(ConcurrentExecutorListResults, self).execute(concurrency, fail_fast)
+        self._concurrency = concurrency
+        return super(ConcurrentExecutorListResults, self).execute(concurrency, fail_fast, consume_on_caller)
 
     def _put_result(self, result, idx, success):
         self._results_queue.append((idx, ExecutionResult(success, result)))
@@ -206,15 +241,42 @@ class ConcurrentExecutorListResults(_ConcurrentExecutor):
                 if not self._exception:
                     self._exception = result
                 self._condition.notify()
+            elif self._consume_on_caller:
+                self._condition.notify()
             elif not self._execute_next() and self._current == self._exec_count:
                 self._condition.notify()
 
     def _results(self):
-        with self._condition:
-            while self._current < self._exec_count:
-                self._condition.wait()
-                if self._exception and self._fail_fast:
-                    self._raise(self._exception)
+        while True:
+            with self._condition:
+                while self._current < self._exec_count:
+                    self._condition.wait()
+                    if self._exception and self._fail_fast:
+                        self._raise(self._exception)
+                    elif self._consume_on_caller:
+                        try:
+                            self._condition.release()
+                            # The number of items to execute can be experimented
+                            for n in xrange(self._concurrency - self._exec_count + self._current):
+                                self._execute_next()
+                        finally:
+                            self._condition.acquire()
+
+            if not self._consume_on_caller:
+                break
+
+            # If all of the queries finished before we call this method,
+            # the above while didn't run, so no new items from the generator were executing
+            any_items_executed = False
+            for n in xrange(self._concurrency):
+                has_more_items = self._execute_next()
+                any_items_executed = any_items_executed or has_more_items
+                if not has_more_items:
+                    break
+
+            if not any_items_executed:
+                break
+
         if self._exception and self._fail_fast:  # raise the exception even if there was no wait
             self._raise(self._exception)
         return [r[1] for r in sorted(self._results_queue)]
